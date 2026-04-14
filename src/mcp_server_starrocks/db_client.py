@@ -27,6 +27,26 @@ from adbc_driver_manager import Error as adbcError
 import pandas as pd
 
 
+# JavaScript Number.MAX_SAFE_INTEGER (2^53 - 1)
+# Integers beyond this range lose precision in JSON when parsed by JavaScript clients.
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def _safe_json_value(v):
+    """Convert integers outside JavaScript's safe integer range to strings.
+
+    JavaScript ``Number`` is IEEE 754 double-precision (53-bit mantissa).
+    Integers with absolute value larger than ``2**53 - 1`` silently lose
+    precision when a JS client parses the JSON.  Converting them to strings
+    preserves the exact value.
+    """
+    if isinstance(v, int) and not isinstance(v, bool) and (
+        v > MAX_SAFE_INTEGER or v < -MAX_SAFE_INTEGER
+    ):
+        return str(v)
+    return v
+
+
 @dataclass
 class ResultSet:
     """Database query result set."""
@@ -79,7 +99,9 @@ class ResultSet:
         }
         if self.column_names is not None:
             ret["column_names"] = self.column_names
-            ret["rows"] = self.rows
+            ret["rows"] = [
+                [_safe_json_value(v) for v in row] for row in self.rows
+            ]
         if self.rows_affected is not None:
             ret["rows_affected"] = self.rows_affected
         if self.error_message:
