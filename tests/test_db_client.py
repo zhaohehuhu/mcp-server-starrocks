@@ -27,6 +27,7 @@ from src.mcp_server_starrocks.db_client import (
     reset_db_connections,
     parse_connection_url
 )
+from src.mcp_server_starrocks.secret_resolver import SecretResolutionError
 
 
 class TestDBClient:
@@ -936,6 +937,113 @@ class TestParseConnectionUrl:
         assert result['host'] == 'sub.domain.com'
         assert result['port'] == '12345'
         assert result['database'] == 'my_db-name'
+
+
+class TestPasswordResolution:
+    """Test password resolution precedence and Keychain integration."""
+
+    def test_explicit_env_password_overrides_keychain_when_url_omits_password(self):
+        """Test STARROCKS_PASSWORD takes precedence when URL omits the password."""
+        with patch.dict(os.environ, {
+            'STARROCKS_URL': 'url_user@db.example.com:9030/production',
+            'STARROCKS_PASSWORD': 'env-secret',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run') as mock_run:
+                client = DBClient()
+
+        assert client.connection_params['user'] == 'url_user'
+        assert client.connection_params['password'] == 'env-secret'
+        assert client.connection_params['database'] == 'production'
+        mock_run.assert_not_called()
+
+    def test_keychain_password_defaults_account_to_user(self):
+        """Test Keychain lookup defaults the account name to the resolved StarRocks user."""
+        mock_result = MagicMock(returncode=0, stdout='keychain-secret\n', stderr='')
+
+        with patch.dict(os.environ, {
+            'STARROCKS_USER': 'analytics_user',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
+                with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value='/usr/bin/security'):
+                    with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result) as mock_run:
+                        client = DBClient()
+
+        assert client.connection_params['user'] == 'analytics_user'
+        assert client.connection_params['password'] == 'keychain-secret'
+        mock_run.assert_called_once_with(
+            ['/usr/bin/security', 'find-generic-password', '-a', 'analytics_user', '-s', 'mcp-server-starrocks', '-w'],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+    def test_keychain_password_used_for_url_without_password(self):
+        """Test URL config can omit the password and fall back to Keychain."""
+        mock_result = MagicMock(returncode=0, stdout='url-keychain-secret\n', stderr='')
+
+        with patch.dict(os.environ, {
+            'STARROCKS_URL': 'url_user@db.example.com:9030/production',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+            'STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT': 'shared-account',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
+                with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value='/usr/bin/security'):
+                    with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result) as mock_run:
+                        client = DBClient()
+
+        assert client.connection_params['user'] == 'url_user'
+        assert client.connection_params['host'] == 'db.example.com'
+        assert client.connection_params['port'] == 9030
+        assert client.connection_params['database'] == 'production'
+        assert client.connection_params['password'] == 'url-keychain-secret'
+        mock_run.assert_called_once_with(
+            ['/usr/bin/security', 'find-generic-password', '-a', 'shared-account', '-s', 'mcp-server-starrocks', '-w'],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+    def test_explicit_empty_url_password_disables_keychain_fallback(self):
+        """Test an explicit empty password in STARROCKS_URL bypasses Keychain lookup."""
+        with patch.dict(os.environ, {
+            'STARROCKS_URL': 'url_user:@db.example.com:9030/production',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run') as mock_run:
+                client = DBClient()
+
+        assert client.connection_params['password'] == ''
+        mock_run.assert_not_called()
+
+    def test_missing_keychain_item_raises_clear_error(self):
+        """Test missing Keychain items raise a clear startup error."""
+        mock_result = MagicMock(
+            returncode=44,
+            stdout='',
+            stderr='security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.'
+        )
+
+        with patch.dict(os.environ, {
+            'STARROCKS_USER': 'analytics_user',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
+                with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value='/usr/bin/security'):
+                    with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result):
+                        with pytest.raises(SecretResolutionError, match='mcp-server-starrocks'):
+                            DBClient()
+
+    def test_non_macos_keychain_config_fails_fast(self):
+        """Test Keychain lookup is rejected with a clear error on non-macOS systems."""
+        with patch.dict(os.environ, {
+            'STARROCKS_USER': 'analytics_user',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'linux'):
+                with pytest.raises(SecretResolutionError, match='only supported on macOS'):
+                    DBClient()
 
 
 class TestDummyMode:

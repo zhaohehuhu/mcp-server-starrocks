@@ -25,6 +25,7 @@ import adbc_driver_manager
 import adbc_driver_flightsql.dbapi as flight_sql
 from adbc_driver_manager import Error as adbcError
 import pandas as pd
+from .secret_resolver import resolve_password
 
 
 @dataclass
@@ -97,7 +98,7 @@ class PerfAnalysisInput(TypedDict):
     analyze_profile: NotRequired[Optional[str]]
 
 
-def parse_connection_url(connection_url: str) -> dict:
+def _parse_connection_url_details(connection_url: str) -> tuple[dict, bool]:
     """
     Parse connection URL into dict with user, password, host, port, database.
     
@@ -122,6 +123,7 @@ def parse_connection_url(connection_url: str) -> dict:
         raise ValueError(f"Invalid connection URL: {connection_url}")
     
     result = match.groupdict()
+    password_provided = result['password'] is not None
 
     # Only keep connection parameters that mysql.connector supports
     # Filter out None values and schema (which is not a mysql.connector parameter)
@@ -142,6 +144,12 @@ def parse_connection_url(connection_url: str) -> dict:
 
     # Note: schema is intentionally excluded as it's not supported by mysql.connector
 
+    return filtered_result, password_provided
+
+
+def parse_connection_url(connection_url: str) -> dict:
+    """Parse connection URL into dict with user, password, host, port, database."""
+    filtered_result, _ = _parse_connection_url_details(connection_url)
     return filtered_result
 
 ANSI_ESCAPE_PATTERN = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -151,6 +159,19 @@ def remove_ansi_codes(text):
   return ANSI_ESCAPE_PATTERN.sub('', text)
 
 
+def _resolve_connection_password(user: str, explicit_password: str, explicit_password_provided: bool) -> str:
+    """Resolve password from explicit config first, then optional Keychain lookup."""
+    if not explicit_password_provided and 'STARROCKS_PASSWORD' in os.environ:
+        explicit_password = os.environ['STARROCKS_PASSWORD']
+        explicit_password_provided = True
+
+    return resolve_password(
+        user=user,
+        explicit_password=explicit_password,
+        explicit_password_provided=explicit_password_provided
+    )
+
+
 class DBClient:
     """Simplified database client for StarRocks connection and query execution."""
     
@@ -158,15 +179,25 @@ class DBClient:
         self.enable_dummy_test = bool(os.getenv('STARROCKS_DUMMY_TEST'))
         self.enable_arrow_flight_sql = bool(os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT'))
         if os.getenv('STARROCKS_URL'):
-            self.connection_params = parse_connection_url(os.getenv('STARROCKS_URL'))
+            self.connection_params, url_password_provided = _parse_connection_url_details(os.getenv('STARROCKS_URL'))
+            self.connection_params['password'] = _resolve_connection_password(
+                user=self.connection_params['user'],
+                explicit_password=self.connection_params['password'],
+                explicit_password_provided=url_password_provided
+            )
             # Convert port to integer for mysql.connector
             self.connection_params['port'] = int(self.connection_params['port'])
         else:
+            user = os.getenv('STARROCKS_USER', 'root')
             self.connection_params = {
                 'host': os.getenv('STARROCKS_HOST', 'localhost'),
                 'port': int(os.getenv('STARROCKS_PORT', '9030')),
-                'user': os.getenv('STARROCKS_USER', 'root'),
-                'password': os.getenv('STARROCKS_PASSWORD', ''),
+                'user': user,
+                'password': _resolve_connection_password(
+                    user=user,
+                    explicit_password=os.getenv('STARROCKS_PASSWORD', ''),
+                    explicit_password_provided='STARROCKS_PASSWORD' in os.environ
+                ),
                 'database': os.getenv('STARROCKS_DB', None),
             }
         self.connection_params.update(**{
