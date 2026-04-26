@@ -66,6 +66,8 @@ def read_password_from_macos_keychain(lookup: KeychainLookupConfig) -> str:
         )
 
     security_command = shutil.which('security')
+    if security_command is None and os.path.exists('/usr/bin/security'):
+        security_command = '/usr/bin/security'
     if security_command is None:
         raise SecretResolutionError(
             "macOS Keychain lookup is configured, but the `security` command is not available."

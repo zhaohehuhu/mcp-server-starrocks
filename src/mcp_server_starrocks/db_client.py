@@ -180,25 +180,28 @@ class DBClient:
         self.enable_arrow_flight_sql = bool(os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT'))
         if os.getenv('STARROCKS_URL'):
             self.connection_params, url_password_provided = _parse_connection_url_details(os.getenv('STARROCKS_URL'))
-            self.connection_params['password'] = _resolve_connection_password(
-                user=self.connection_params['user'],
-                explicit_password=self.connection_params['password'],
-                explicit_password_provided=url_password_provided
-            )
+            self._password_resolution = {
+                'user': self.connection_params['user'],
+                'explicit_password': self.connection_params['password'],
+                'explicit_password_provided': url_password_provided,
+            }
             # Convert port to integer for mysql.connector
             self.connection_params['port'] = int(self.connection_params['port'])
         else:
             user = os.getenv('STARROCKS_USER', 'root')
+            explicit_password = os.getenv('STARROCKS_PASSWORD', '')
+            explicit_password_provided = 'STARROCKS_PASSWORD' in os.environ
             self.connection_params = {
                 'host': os.getenv('STARROCKS_HOST', 'localhost'),
                 'port': int(os.getenv('STARROCKS_PORT', '9030')),
                 'user': user,
-                'password': _resolve_connection_password(
-                    user=user,
-                    explicit_password=os.getenv('STARROCKS_PASSWORD', ''),
-                    explicit_password_provided='STARROCKS_PASSWORD' in os.environ
-                ),
+                'password': explicit_password,
                 'database': os.getenv('STARROCKS_DB', None),
+            }
+            self._password_resolution = {
+                'user': user,
+                'explicit_password': explicit_password,
+                'explicit_password_provided': explicit_password_provided,
             }
         self.connection_params.update(**{
             'auth_plugin': os.getenv('STARROCKS_MYSQL_AUTH_PLUGIN', 'mysql_native_password'),
@@ -217,12 +220,18 @@ class DBClient:
         
         # ADBC connection (singleton)
         self._adbc_connection = None
+
+    def _get_connection_params(self):
+        """Return connection parameters with password resolved only when needed."""
+        params = dict(self.connection_params)
+        params['password'] = _resolve_connection_password(**self._password_resolution)
+        return params
     
     def _get_connection_pool(self):
         """Get or create a connection pool for MySQL connections."""
         if self._connection_pool is None:
             try:
-                self._connection_pool = mysql.connector.pooling.MySQLConnectionPool(**self.connection_params)
+                self._connection_pool = mysql.connector.pooling.MySQLConnectionPool(**self._get_connection_params())
             except MySQLError as conn_err:
                 raise conn_err
         
@@ -258,10 +267,11 @@ class DBClient:
     
     def _create_adbc_connection(self):
         """Create a new ADBC connection."""
-        fe_host = self.connection_params['host']
+        connection_params = self._get_connection_params()
+        fe_host = connection_params['host']
         fe_port = os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT', '')
-        user = self.connection_params['user']
-        password = self.connection_params['password']
+        user = connection_params['user']
+        password = connection_params['password']
         
         try:
             connection = flight_sql.connect(

@@ -944,22 +944,29 @@ class TestPasswordResolution:
 
     def test_explicit_env_password_overrides_keychain_when_url_omits_password(self):
         """Test STARROCKS_PASSWORD takes precedence when URL omits the password."""
+        mock_pool = MagicMock()
         with patch.dict(os.environ, {
             'STARROCKS_URL': 'url_user@db.example.com:9030/production',
             'STARROCKS_PASSWORD': 'env-secret',
             'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
         }, clear=True):
             with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run') as mock_run:
-                client = DBClient()
+                with patch('src.mcp_server_starrocks.db_client.mysql.connector.pooling.MySQLConnectionPool', return_value=mock_pool) as mock_pool_ctor:
+                    client = DBClient()
+                    mock_run.assert_not_called()
+                    client._get_connection_pool()
 
         assert client.connection_params['user'] == 'url_user'
-        assert client.connection_params['password'] == 'env-secret'
+        assert client.connection_params['password'] == ''
         assert client.connection_params['database'] == 'production'
         mock_run.assert_not_called()
+        mock_pool_ctor.assert_called_once()
+        assert mock_pool_ctor.call_args.kwargs['password'] == 'env-secret'
 
     def test_keychain_password_defaults_account_to_user(self):
         """Test Keychain lookup defaults the account name to the resolved StarRocks user."""
         mock_result = MagicMock(returncode=0, stdout='keychain-secret\n', stderr='')
+        mock_pool = MagicMock()
 
         with patch.dict(os.environ, {
             'STARROCKS_USER': 'analytics_user',
@@ -968,10 +975,39 @@ class TestPasswordResolution:
             with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
                 with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value='/usr/bin/security'):
                     with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result) as mock_run:
-                        client = DBClient()
+                        with patch('src.mcp_server_starrocks.db_client.mysql.connector.pooling.MySQLConnectionPool', return_value=mock_pool):
+                            client = DBClient()
+                            assert client.connection_params['password'] == ''
+                            mock_run.assert_not_called()
+                            client._get_connection_pool()
 
         assert client.connection_params['user'] == 'analytics_user'
-        assert client.connection_params['password'] == 'keychain-secret'
+        assert client.connection_params['password'] == ''
+        mock_run.assert_called_once_with(
+            ['/usr/bin/security', 'find-generic-password', '-a', 'analytics_user', '-s', 'mcp-server-starrocks', '-w'],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+    def test_keychain_password_uses_usr_bin_security_when_path_is_empty(self):
+        """Test macOS lookup falls back to /usr/bin/security when PATH does not expose it."""
+        mock_result = MagicMock(returncode=0, stdout='keychain-secret\n', stderr='')
+        mock_pool = MagicMock()
+
+        with patch.dict(os.environ, {
+            'STARROCKS_USER': 'analytics_user',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
+                with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value=None):
+                    with patch('src.mcp_server_starrocks.secret_resolver.os.path.exists', return_value=True):
+                        with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result) as mock_run:
+                            with patch('src.mcp_server_starrocks.db_client.mysql.connector.pooling.MySQLConnectionPool', return_value=mock_pool):
+                                client = DBClient()
+                                client._get_connection_pool()
+
+        assert client.connection_params['password'] == ''
         mock_run.assert_called_once_with(
             ['/usr/bin/security', 'find-generic-password', '-a', 'analytics_user', '-s', 'mcp-server-starrocks', '-w'],
             capture_output=True,
@@ -982,6 +1018,7 @@ class TestPasswordResolution:
     def test_keychain_password_used_for_url_without_password(self):
         """Test URL config can omit the password and fall back to Keychain."""
         mock_result = MagicMock(returncode=0, stdout='url-keychain-secret\n', stderr='')
+        mock_pool = MagicMock()
 
         with patch.dict(os.environ, {
             'STARROCKS_URL': 'url_user@db.example.com:9030/production',
@@ -991,13 +1028,17 @@ class TestPasswordResolution:
             with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
                 with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value='/usr/bin/security'):
                     with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result) as mock_run:
-                        client = DBClient()
+                        with patch('src.mcp_server_starrocks.db_client.mysql.connector.pooling.MySQLConnectionPool', return_value=mock_pool):
+                            client = DBClient()
+                            assert client.connection_params['password'] == ''
+                            mock_run.assert_not_called()
+                            client._get_connection_pool()
 
         assert client.connection_params['user'] == 'url_user'
         assert client.connection_params['host'] == 'db.example.com'
         assert client.connection_params['port'] == 9030
         assert client.connection_params['database'] == 'production'
-        assert client.connection_params['password'] == 'url-keychain-secret'
+        assert client.connection_params['password'] == ''
         mock_run.assert_called_once_with(
             ['/usr/bin/security', 'find-generic-password', '-a', 'shared-account', '-s', 'mcp-server-starrocks', '-w'],
             capture_output=True,
@@ -1024,6 +1065,7 @@ class TestPasswordResolution:
             stdout='',
             stderr='security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.'
         )
+        mock_pool = MagicMock()
 
         with patch.dict(os.environ, {
             'STARROCKS_USER': 'analytics_user',
@@ -1032,18 +1074,38 @@ class TestPasswordResolution:
             with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'darwin'):
                 with patch('src.mcp_server_starrocks.secret_resolver.shutil.which', return_value='/usr/bin/security'):
                     with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run', return_value=mock_result):
-                        with pytest.raises(SecretResolutionError, match='mcp-server-starrocks'):
-                            DBClient()
+                        with patch('src.mcp_server_starrocks.db_client.mysql.connector.pooling.MySQLConnectionPool', return_value=mock_pool):
+                            client = DBClient()
+                            with pytest.raises(SecretResolutionError, match='mcp-server-starrocks'):
+                                client._get_connection_pool()
 
     def test_non_macos_keychain_config_fails_fast(self):
-        """Test Keychain lookup is rejected with a clear error on non-macOS systems."""
+        """Test Keychain lookup is rejected with a clear error on non-macOS systems when connecting."""
+        mock_pool = MagicMock()
+
         with patch.dict(os.environ, {
             'STARROCKS_USER': 'analytics_user',
             'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
         }, clear=True):
             with patch('src.mcp_server_starrocks.secret_resolver.sys.platform', 'linux'):
-                with pytest.raises(SecretResolutionError, match='only supported on macOS'):
-                    DBClient()
+                with patch('src.mcp_server_starrocks.db_client.mysql.connector.pooling.MySQLConnectionPool', return_value=mock_pool):
+                    client = DBClient()
+                    with pytest.raises(SecretResolutionError, match='only supported on macOS'):
+                        client._get_connection_pool()
+
+    def test_dummy_mode_does_not_resolve_keychain_password(self):
+        """Test dummy mode still works even if Keychain lookup is configured."""
+        with patch.dict(os.environ, {
+            'STARROCKS_DUMMY_TEST': '1',
+            'STARROCKS_PASSWORD_KEYCHAIN_SERVICE': 'mcp-server-starrocks',
+        }, clear=True):
+            with patch('src.mcp_server_starrocks.secret_resolver.subprocess.run') as mock_run:
+                client = DBClient()
+                result = client.execute("SELECT * FROM any_table")
+
+        assert result.success is True
+        assert result.rows == [['aaa'], ['bbb'], ['ccc']]
+        mock_run.assert_not_called()
 
 
 class TestDummyMode:
