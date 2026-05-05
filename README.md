@@ -177,6 +177,8 @@ You can configure StarRocks connection using either individual environment varia
 - `STARROCKS_PORT`: (Optional) MySQL protocol port of the StarRocks FE service. Defaults to `9030`.
 - `STARROCKS_USER`: (Optional) StarRocks username. Defaults to `root`.
 - `STARROCKS_PASSWORD`: (Optional) StarRocks password. Defaults to empty string.
+- `STARROCKS_PASSWORD_KEYCHAIN_SERVICE`: (Optional, macOS only) Generic password service name to use when reading the password from Keychain. This is only used when no explicit password is provided via `STARROCKS_PASSWORD` or `STARROCKS_URL`.
+- `STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT`: (Optional, macOS only) Generic password account name to use when reading the password from Keychain. Defaults to the resolved StarRocks user.
 - `STARROCKS_DB`: (Optional) Default database to use if not specified in tool arguments or resource URIs. If set, the connection will attempt to `USE` this database. Tools like `table_overview` and `db_overview` will use this if the database part is omitted in their arguments. Defaults to empty (no default database).
 
 **Option 2: Connection URL (takes precedence over individual variables)**
@@ -187,6 +189,33 @@ You can configure StarRocks connection using either individual environment varia
   - `root:mypass@localhost:9030/test_db`
   - `mysql://admin:secret@db.example.com:9030/production`  
   - `starrocks://user:pass@192.168.1.100:9030/analytics`
+
+Password precedence:
+- A password embedded in `STARROCKS_URL` wins, including an explicit empty password like `user:@host:9030/db`.
+- If `STARROCKS_URL` omits the password, `STARROCKS_PASSWORD` is used when set.
+- If neither explicit password source is set and `STARROCKS_PASSWORD_KEYCHAIN_SERVICE` is configured, the password is read from macOS Keychain.
+
+**macOS Keychain example**
+
+Store the password:
+
+```bash
+security add-generic-password -U -a root -s mcp-server-starrocks -w 'secret'
+```
+
+Verify the stored password:
+
+```bash
+security find-generic-password -a root -s mcp-server-starrocks -w
+```
+
+Use it with this server:
+
+```bash
+export STARROCKS_URL=root@localhost:9030/test_db
+export STARROCKS_PASSWORD_KEYCHAIN_SERVICE=mcp-server-starrocks
+export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
+```
 
 ### Additional Configuration
 
