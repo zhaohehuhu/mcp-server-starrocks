@@ -15,6 +15,7 @@ import argparse
 import ast
 import asyncio
 import base64
+import csv
 import json
 import math
 import sys
@@ -54,6 +55,71 @@ mcp = FastMCP('mcp-server-starrocks')
 overview_length_limit = int(os.getenv('STARROCKS_OVERVIEW_LIMIT', str(20000)))
 # Global cache for table overviews: {(db_name, table_name): overview_string}
 global_table_overview_cache = {}
+
+# Directory where read_query writes result files when output_file is a relative path.
+DEFAULT_OUTPUT_DIR = os.path.expanduser("~/.mcp-server-starrocks/output")
+output_dir = os.path.expanduser(os.getenv('STARROCKS_MCP_OUTPUT_DIR', DEFAULT_OUTPUT_DIR))
+
+# Transport mode, captured at server startup so tools can warn when files
+# are written on a remote server filesystem rather than the user's machine.
+_transport_mode = os.getenv('MCP_TRANSPORT_MODE', 'stdio')
+
+_EXT_TO_FORMAT = {'.csv': 'csv', '.tsv': 'tsv', '.json': 'json',
+                  '.jsonl': 'jsonl', '.ndjson': 'jsonl'}
+_SUPPORTED_OUTPUT_FORMATS = ('csv', 'tsv', 'json', 'jsonl')
+
+
+def _resolve_output_path(output_file: str) -> str:
+    """Resolve output_file to an absolute path.
+
+    Absolute paths (after ~ expansion) are used as-is. Relative paths are
+    resolved against output_dir. The parent directory is created if missing.
+    """
+    path = os.path.expanduser(output_file)
+    if not os.path.isabs(path):
+        path = os.path.join(output_dir, path)
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
+
+def _infer_output_format(path: str, fmt: str | None) -> str:
+    if fmt:
+        f = fmt.lower()
+        if f not in _SUPPORTED_OUTPUT_FORMATS:
+            raise ValueError(
+                f"Unsupported output_format '{fmt}'. Use one of: {', '.join(_SUPPORTED_OUTPUT_FORMATS)}.")
+        return f
+    ext = os.path.splitext(path)[1].lower()
+    return _EXT_TO_FORMAT.get(ext, 'csv')
+
+
+def _write_result_to_file(result: ResultSet, path: str, fmt: str) -> None:
+    """Write a successful ResultSet to disk in the given format."""
+    if not result.success or result.column_names is None or result.rows is None:
+        raise ValueError("Cannot write empty or failed result to file.")
+    if fmt in ('csv', 'tsv'):
+        delim = '\t' if fmt == 'tsv' else ','
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter=delim)
+            writer.writerow(result.column_names)
+            for row in result.rows:
+                writer.writerow(row)
+    elif fmt == 'json':
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(
+                [dict(zip(result.column_names, row)) for row in result.rows],
+                f, default=str)
+    elif fmt == 'jsonl':
+        with open(path, 'w', encoding='utf-8') as f:
+            for row in result.rows:
+                f.write(json.dumps(dict(zip(result.column_names, row)), default=str))
+                f.write('\n')
+    else:
+        raise ValueError(
+            f"Unsupported format '{fmt}'. Use one of: {', '.join(_SUPPORTED_OUTPUT_FORMATS)}.")
 
 # Get database client instance
 db_client = get_db_client()
@@ -188,16 +254,57 @@ def _get_table_details(db_name, table_name, limit=None):
 
 # tools
 
-@mcp.tool(description="Execute a SELECT query or commands that return a ResultSet" + description_suffix)
+@mcp.tool(description="Execute a SELECT query or commands that return a ResultSet. Set output_file to write the full result to disk instead of returning it inline (useful for large results)." + description_suffix)
 def read_query(query: Annotated[str, Field(description="SQL query to execute")],
-               db: Annotated[str|None, Field(description="database")] = None) -> ToolResult:
-    # return csv like result set, with column names as first row
+               db: Annotated[str|None, Field(description="database")] = None,
+               output_file: Annotated[str|None, Field(
+                   description="If set, write the full result to this file and return only a summary + small preview inline. Relative paths resolve against STARROCKS_MCP_OUTPUT_DIR (default: ~/.mcp-server-starrocks/output/). Absolute paths (and ~) are used as-is. Format is inferred from the file extension (.csv, .tsv, .json, .jsonl, .ndjson) unless output_format is given. NOTE: the file is written on the server's filesystem, which may not be the client machine in remote/http deployments."
+               )] = None,
+               output_format: Annotated[str|None, Field(
+                   description="Override file format: csv|tsv|json|jsonl. If omitted, inferred from output_file extension; defaults to csv."
+               )] = None) -> ToolResult:
     logger.info(f"Executing read query: {query[:100]}{'...' if len(query) > 100 else ''}")
     result = db_client.execute(query, db=db)
-    if result.success:
-        logger.info(f"Query executed successfully, returned {len(result.rows) if result.rows else 0} rows")
-    else:
+    if not result.success:
         logger.error(f"Query failed: {result.error_message}")
+        return ToolResult(content=[TextContent(type='text', text=result.to_string(limit=10000))],
+                          structured_content=result.to_dict())
+
+    rows_n = len(result.rows) if result.rows else 0
+    logger.info(f"Query executed successfully, returned {rows_n} rows")
+
+    if output_file:
+        try:
+            resolved = _resolve_output_path(output_file)
+            fmt = _infer_output_format(resolved, output_format)
+            _write_result_to_file(result, resolved, fmt)
+        except Exception as e:
+            logger.exception(f"Failed to write result to {output_file}")
+            return ToolResult(
+                content=[TextContent(type='text',
+                                     text=f"Error writing result to file: {e}\n\nResult preview:\n{result.to_string(limit=2000)}")],
+                structured_content=result.to_dict(),
+            )
+
+        size = os.path.getsize(resolved)
+        warn = ""
+        if _transport_mode != 'stdio':
+            warn = (f"\nNOTE: MCP server transport is '{_transport_mode}'. "
+                    f"This file is written on the server's filesystem. "
+                    f"If the server is running on a remote machine, retrieve it from there.")
+        preview = result.to_string(limit=2000)
+        text = (f"Wrote {rows_n} rows to {resolved} ({size} bytes, format={fmt}).{warn}\n"
+                f"Preview:\n{preview}")
+        structured = result.to_dict()
+        # full data is on disk now; drop bulky rows from the structured payload
+        structured.pop('rows', None)
+        structured['output_file'] = resolved
+        structured['output_format'] = fmt
+        structured['output_bytes'] = size
+        structured['rows_written'] = rows_n
+        return ToolResult(content=[TextContent(type='text', text=text)],
+                          structured_content=structured)
+
     return ToolResult(content=[TextContent(type='text', text=result.to_string(limit=10000))],
                       structured_content=result.to_dict())
 
@@ -555,7 +662,10 @@ async def main():
                         help='Run in test mode')
     
     args = parser.parse_args()
-    
+
+    global _transport_mode
+    _transport_mode = args.mode
+
     logger.info(f"Starting StarRocks MCP Server with mode={args.mode}, host={args.host}, port={args.port} default_db={db_client.default_database or 'None'}")
     
     if args.test:
