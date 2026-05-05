@@ -21,11 +21,13 @@ os.environ.pop('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT', None)  # Force MySQL mode f
 os.environ.pop('STARROCKS_DB', None)  # No default database
 
 from src.mcp_server_starrocks.db_client import (
-    DBClient, 
-    ResultSet, 
-    get_db_client, 
+    DBClient,
+    ResultSet,
+    get_db_client,
     reset_db_connections,
-    parse_connection_url
+    parse_connection_url,
+    _safe_json_value,
+    MAX_SAFE_INTEGER,
 )
 
 
@@ -617,6 +619,131 @@ class TestResultSet:
         assert result.column_names is None
         assert result.rows is None
         assert result.error_message is None
+
+
+class TestSafeJsonValue:
+    """Test cases for _safe_json_value helper and ResultSet.to_dict() bigint handling."""
+
+    def test_small_integers_unchanged(self):
+        """Integers within safe range should be returned as-is."""
+        assert _safe_json_value(0) == 0
+        assert _safe_json_value(1) == 1
+        assert _safe_json_value(-1) == -1
+        assert _safe_json_value(42) == 42
+        assert _safe_json_value(MAX_SAFE_INTEGER) == MAX_SAFE_INTEGER
+        assert _safe_json_value(-MAX_SAFE_INTEGER) == -MAX_SAFE_INTEGER
+
+    def test_large_positive_integers_become_strings(self):
+        """Integers above MAX_SAFE_INTEGER should become strings."""
+        val = MAX_SAFE_INTEGER + 1  # 2^53
+        assert _safe_json_value(val) == str(val)
+
+        val = MAX_SAFE_INTEGER + 2  # 2^53 + 1
+        assert _safe_json_value(val) == str(val)
+
+        val = 55309298709016489
+        assert _safe_json_value(val) == "55309298709016489"
+
+    def test_large_negative_integers_become_strings(self):
+        """Integers below -MAX_SAFE_INTEGER should become strings."""
+        val = -MAX_SAFE_INTEGER - 1
+        assert _safe_json_value(val) == str(val)
+
+        val = -7108510333361982070
+        assert _safe_json_value(val) == "-7108510333361982070"
+
+    def test_non_integer_types_unchanged(self):
+        """Non-integer types should pass through unmodified."""
+        assert _safe_json_value("hello") == "hello"
+        assert _safe_json_value(3.14) == 3.14
+        assert _safe_json_value(None) is None
+        assert _safe_json_value([1, 2]) == [1, 2]
+
+    def test_booleans_not_converted(self):
+        """Booleans (subclass of int in Python) must not be stringified."""
+        assert _safe_json_value(True) is True
+        assert _safe_json_value(False) is False
+
+    def test_boundary_values(self):
+        """Test exact boundary: MAX_SAFE_INTEGER is safe, MAX_SAFE_INTEGER+1 is not."""
+        assert _safe_json_value(MAX_SAFE_INTEGER) == MAX_SAFE_INTEGER
+        assert isinstance(_safe_json_value(MAX_SAFE_INTEGER), int)
+
+        assert _safe_json_value(MAX_SAFE_INTEGER + 1) == str(MAX_SAFE_INTEGER + 1)
+        assert isinstance(_safe_json_value(MAX_SAFE_INTEGER + 1), str)
+
+        assert _safe_json_value(-MAX_SAFE_INTEGER) == -MAX_SAFE_INTEGER
+        assert isinstance(_safe_json_value(-MAX_SAFE_INTEGER), int)
+
+        assert _safe_json_value(-MAX_SAFE_INTEGER - 1) == str(-MAX_SAFE_INTEGER - 1)
+        assert isinstance(_safe_json_value(-MAX_SAFE_INTEGER - 1), str)
+
+    def test_to_dict_converts_large_integers_in_rows(self):
+        """ResultSet.to_dict() should convert large ints in rows to strings."""
+        large_val = 9007199254740993  # 2^53 + 1
+        neg_large = -7108510333361982070
+        safe_val = 42
+
+        result = ResultSet(
+            success=True,
+            column_names=['id', 'big_val', 'neg_val'],
+            rows=[[safe_val, large_val, neg_large]],
+            execution_time=0.1,
+        )
+
+        d = result.to_dict()
+        assert d["rows"] == [[42, str(large_val), str(neg_large)]]
+
+    def test_to_dict_preserves_safe_integers(self):
+        """ResultSet.to_dict() should keep safe integers as ints."""
+        result = ResultSet(
+            success=True,
+            column_names=['a', 'b'],
+            rows=[[1, MAX_SAFE_INTEGER], [-1, -MAX_SAFE_INTEGER]],
+            execution_time=0.05,
+        )
+
+        d = result.to_dict()
+        assert d["rows"] == [[1, MAX_SAFE_INTEGER], [-1, -MAX_SAFE_INTEGER]]
+        # Verify they are still ints, not strings
+        assert isinstance(d["rows"][0][1], int)
+        assert isinstance(d["rows"][1][1], int)
+
+    def test_to_dict_mixed_types_in_rows(self):
+        """ResultSet.to_dict() handles rows with mixed types correctly."""
+        large_val = 2**53 + 100
+        result = ResultSet(
+            success=True,
+            column_names=['id', 'name', 'big', 'flag', 'ratio'],
+            rows=[[1, 'hello', large_val, True, 3.14]],
+            execution_time=0.1,
+        )
+
+        d = result.to_dict()
+        row = d["rows"][0]
+        assert row[0] == 1          # safe int unchanged
+        assert row[1] == 'hello'    # string unchanged
+        assert row[2] == str(large_val)  # large int -> string
+        assert row[3] is True       # bool unchanged
+        assert row[4] == 3.14       # float unchanged
+
+    def test_to_dict_does_not_mutate_original_rows(self):
+        """to_dict() must not modify the original ResultSet.rows."""
+        large_val = 2**53 + 1
+        original_rows = [[1, large_val]]
+        result = ResultSet(
+            success=True,
+            column_names=['id', 'big'],
+            rows=original_rows,
+            execution_time=0.1,
+        )
+
+        d = result.to_dict()
+        # The dict should have the string version
+        assert d["rows"][0][1] == str(large_val)
+        # But original rows should be untouched
+        assert result.rows[0][1] == large_val
+        assert isinstance(result.rows[0][1], int)
 
 
 class TestParseConnectionUrl:
