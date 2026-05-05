@@ -1,5 +1,39 @@
 # StarRocks MCP Server Release Notes
 
+## Version 0.4.0
+
+### Enhancements
+
+1. **Upgrade FastMCP to 2.14+** (commit e21bcd9)
+   - Bumped fastmcp dependency requirement from `>=2.12.0,<2.13.0` to `>=2.14.0`
+   - Picks up upstream improvements and bug fixes from the FastMCP framework
+
+2. **Support `use_pure` connection parameter** (commit 65398d1)
+   - Added new `STARROCKS_USE_PURE` environment variable
+   - Passes through to mysql.connector's `use_pure` connection parameter
+   - Allows users to force the pure-Python MySQL implementation when the C extension causes issues
+   - Defaults to `false`; accepts `true`, `1`, or `yes` (case-insensitive) to enable
+
+3. **macOS Keychain-backed password lookup** (commits ac33aec, f847013, PR #39)
+   - `STARROCKS_PASSWORD` now accepts a `keychain:<service>[/<account>]` reference, resolved via the macOS `security` CLI at connection time
+   - Keeps credentials out of environment variables, shell history, and process listings on macOS
+   - Lookup is deferred until the first connection, so a missing keychain entry only fails when actually connecting
+   - Thanks to @yakirgb for the contribution
+
+### Bug Fixes
+
+1. **Fix inconsistency of table_overview row limit description** (commit 9067b9e)
+   - Corrected the tool description for `table_overview` to state "up to 3" sample rows, matching the actual behavior (previously documented as "up to 5")
+
+2. **Fix BIGINT precision loss in structured_content JSON serialization** (commit 620bf40, PR #37, fixes #36)
+   - Integers exceeding JavaScript's `Number.MAX_SAFE_INTEGER` (2^53-1) are now converted to strings in `ResultSet.to_dict()` so MCP clients no longer silently round large BIGINT values when parsing JSON
+   - The text content path (`to_string`) is unaffected
+   - Thanks to @mixermt for the contribution
+
+### Breaking Changes
+
+None - this release maintains full backward compatibility with version 0.3.0.
+
 ## Version 0.3.0
 
 ### Bug Fixes
