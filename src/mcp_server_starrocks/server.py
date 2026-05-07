@@ -23,12 +23,12 @@ import os
 import traceback
 import threading
 import time
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 from fastmcp.utilities.types import Image
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent, ImageContent
 from fastmcp.exceptions import ToolError
-from typing import Annotated
+from typing import Annotated, Optional
 from pydantic import Field
 import plotly.express as px
 import plotly.graph_objs
@@ -126,7 +126,18 @@ db_client = get_db_client()
 # Get database summary manager instance
 db_summary_manager = get_db_summary_manager(db_client)
 # Description suffix for tools, if default db is set
-description_suffix = f". db session already in default db `{db_client.default_database}`" if db_client.default_database else ""
+description_suffix = f". Global default db is `{db_client.default_database}`; use set_session_db to override per session" \
+    if db_client.default_database else ". Use set_session_db to set a per-session default database"
+
+
+def _safe_session_id(ctx: Optional[Context]) -> Optional[str]:
+    """Return ctx.session_id, or None when unavailable (e.g. no active request context)."""
+    if ctx is None:
+        return None
+    try:
+        return ctx.session_id
+    except (RuntimeError, AttributeError):
+        return None
 
 # Initialize connection health checker
 _health_checker = initialize_health_checker(db_client)
@@ -262,9 +273,10 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
                )] = None,
                output_format: Annotated[str|None, Field(
                    description="Override file format: csv|tsv|json|jsonl. If omitted, inferred from output_file extension; defaults to csv."
-               )] = None) -> ToolResult:
+               )] = None,
+               ctx: Context = None) -> ToolResult:
     logger.info(f"Executing read query: {query[:100]}{'...' if len(query) > 100 else ''}")
-    result = db_client.execute(query, db=db)
+    result = db_client.execute(query, db=db, session_id=_safe_session_id(ctx))
     if not result.success:
         logger.error(f"Query failed: {result.error_message}")
         return ToolResult(content=[TextContent(type='text', text=result.to_string(limit=10000))],
@@ -311,9 +323,10 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
 
 @mcp.tool(description="Execute a DDL/DML or other StarRocks command that do not have a ResultSet" + description_suffix)
 def write_query(query: Annotated[str, Field(description="SQL to execute")],
-                db: Annotated[str|None, Field(description="database")] = None) -> ToolResult:
+                db: Annotated[str|None, Field(description="database")] = None,
+                ctx: Context = None) -> ToolResult:
     logger.info(f"Executing write query: {query[:100]}{'...' if len(query) > 100 else ''}")
-    result = db_client.execute(query, db=db)
+    result = db_client.execute(query, db=db, session_id=_safe_session_id(ctx))
     if not result.success:
         logger.error(f"Write query failed: {result.error_message}")
     elif result.rows_affected is not None and result.rows_affected >= 0:
@@ -328,14 +341,16 @@ def analyze_query(
         uuid: Annotated[
             str|None, Field(description="Query ID, a string composed of 32 hexadecimal digits formatted as 8-4-4-4-12")]=None,
         sql: Annotated[str|None, Field(description="Query SQL")]=None,
-        db: Annotated[str|None, Field(description="database")] = None
+        db: Annotated[str|None, Field(description="database")] = None,
+        ctx: Context = None,
 ) -> str:
+    sid = _safe_session_id(ctx)
     if uuid:
         logger.info(f"Analyzing query profile for UUID: {uuid}")
-        return db_client.execute(f"ANALYZE PROFILE FROM '{uuid}'", db=db).to_string()
+        return db_client.execute(f"ANALYZE PROFILE FROM '{uuid}'", db=db, session_id=sid).to_string()
     elif sql:
         logger.info(f"Analyzing query: {sql[:100]}{'...' if len(sql) > 100 else ''}")
-        return db_client.execute(f"EXPLAIN ANALYZE {sql}", db=db).to_string()
+        return db_client.execute(f"EXPLAIN ANALYZE {sql}", db=db, session_id=sid).to_string()
     else:
         logger.warning("Analyze query called without valid UUID or SQL")
         return f"Failed to analyze query, the reasons maybe: 1.query id is not standard uuid format; 2.the SQL statement have spelling error."
@@ -344,10 +359,11 @@ def analyze_query(
 @mcp.tool(description="Run a query to get it's query dump and profile, output very large, need special tools to do further processing")
 def collect_query_dump_and_profile(
         query: Annotated[str, Field(description="query to execute")],
-        db: Annotated[str|None, Field(description="database")] = None
+        db: Annotated[str|None, Field(description="database")] = None,
+        ctx: Context = None,
 ) -> ToolResult:
     logger.info(f"Collecting query dump and profile for query: {query[:100]}{'...' if len(query) > 100 else ''}")
-    result : PerfAnalysisInput = db_client.collect_perf_analysis_input(query, db=db)
+    result : PerfAnalysisInput = db_client.collect_perf_analysis_input(query, db=db, session_id=_safe_session_id(ctx))
     if result.get('error_message'):
         status = f"collecting query dump and profile failed, query_id={result.get('query_id')} error_message={result.get('error_message')}"
         logger.warning(status)
@@ -434,7 +450,8 @@ def query_and_plotly_chart(
         plotly_expr: Annotated[
             str, Field(description="a one function call expression, with 2 vars binded: `px` as `import plotly.express as px`, and `df` as dataframe generated by query `plotly_expr` example: `px.scatter(df, x=\"sepal_width\", y=\"sepal_length\", color=\"species\", marginal_y=\"violin\", marginal_x=\"box\", trendline=\"ols\", template=\"simple_white\")`")],
         format: Annotated[str, Field(description="chart output format, json|png|jpeg")] = "jpeg",
-        db: Annotated[str|None, Field(description="database")] = None
+        db: Annotated[str|None, Field(description="database")] = None,
+        ctx: Context = None,
 ) -> ToolResult:
     """
     Executes an SQL query, creates a Pandas DataFrame, generates a Plotly chart
@@ -455,7 +472,7 @@ def query_and_plotly_chart(
     """
     try:
         logger.info(f'query_and_plotly_chart query:{one_line_summary(query)}, plotly:{one_line_summary(plotly_expr)} format:{format}, db:{db}')
-        result = db_client.execute(query, db=db, return_format="pandas")
+        result = db_client.execute(query, db=db, return_format="pandas", session_id=_safe_session_id(ctx))
         errmsg = None
         if not result.success:
             errmsg = result.error_message
@@ -515,7 +532,8 @@ def table_overview(
         table: Annotated[str, Field(
             description="Table name, optionally prefixed with database name (e.g., 'db_name.table_name'). If database is omitted, uses the default database.")],
         refresh: Annotated[
-            bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False
+            bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False,
+        ctx: Context = None,
 ) -> str:
     try:
         logger.info(f"Getting table overview for: {table}, refresh={refresh}")
@@ -531,7 +549,8 @@ def table_overview(
             db_name, table_name = parts[0], parts[1]
         elif len(parts) == 1:
             table_name = parts[0]
-            db_name = db_client.default_database  # Use default if only table name is given
+            # Use per-session default first, falling back to global default.
+            db_name = db_client.get_session_default_db(_safe_session_id(ctx))
 
         if not table_name:  # Should not happen if table_arg exists, but check
             logger.error(f"Invalid table name format: {table}")
@@ -626,10 +645,11 @@ def db_summary(
         limit: Annotated[int, Field(
             description="Output length limit in characters. Defaults to 10000. Higher values show more tables and details.")] = 10000,
         refresh: Annotated[bool, Field(
-            description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False
+            description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False,
+        ctx: Context = None,
 ) -> str:
     try:
-        db_name = db if db else db_client.default_database
+        db_name = db if db else db_client.get_session_default_db(_safe_session_id(ctx))
         logger.info(f"Getting database summary for: {db_name}, limit={limit}, refresh={refresh}")
         
         if not db_name:
@@ -647,6 +667,29 @@ def db_summary(
         reset_db_connections()
         stack_trace = traceback.format_exc()
         return f"Unexpected Error executing tool 'db_summary': {type(e).__name__}: {e}\nStack Trace:\n{stack_trace}"
+
+
+@mcp.tool(description="Set or clear the default database for THIS MCP session. Subsequent tool calls without an explicit `db` argument will use this database. Pass an empty string or null to clear and fall back to the server's global default. Returns the new effective default for this session.")
+def set_session_db(
+        db: Annotated[str | None, Field(
+            description="Database name to set as the per-session default. Empty/null clears the override.")] = None,
+        ctx: Context = None,
+) -> str:
+    session_id = _safe_session_id(ctx)
+    if not session_id:
+        return "Error: no MCP session id available; cannot set a per-session default database."
+    if not db:
+        db_client.set_session_default_db(session_id, None)
+        effective = db_client.get_session_default_db(session_id)
+        if effective:
+            return f"Cleared per-session default. Falling back to global default `{effective}`."
+        return "Cleared per-session default. No global default is set."
+    # Validate by issuing USE on a real connection.
+    probe = db_client.execute(f"USE `{db}`")
+    if not probe.success:
+        return f"Failed to switch session to `{db}`: {probe.error_message}"
+    db_client.set_session_default_db(session_id, db)
+    return f"Per-session default database set to `{db}`."
 
 
 async def main():

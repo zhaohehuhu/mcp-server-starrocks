@@ -17,6 +17,8 @@ import os
 import time
 import re
 import json
+import threading
+from contextlib import nullcontext
 from typing import Optional, List, Any, Union, Literal, TypedDict, NotRequired
 from dataclasses import dataclass
 import mysql.connector
@@ -239,9 +241,38 @@ class DBClient:
 
         # MySQL connection pool
         self._connection_pool = None
-        
-        # ADBC connection (singleton)
+
+        # ADBC connection (singleton). The shared connection is not safe for
+        # concurrent use, so all access is serialized through _adbc_lock.
         self._adbc_connection = None
+        self._adbc_lock = threading.Lock()
+
+        # Per-MCP-session default database, keyed by FastMCP session_id.
+        # Falls back to self.default_database when no entry is set.
+        self._session_default_dbs: dict[str, str] = {}
+        self._session_dbs_lock = threading.Lock()
+
+    def get_session_default_db(self, session_id: Optional[str]) -> Optional[str]:
+        """Return the effective default db for a session, falling back to the global default."""
+        if session_id:
+            with self._session_dbs_lock:
+                if session_id in self._session_default_dbs:
+                    return self._session_default_dbs[session_id]
+        return self.default_database
+
+    def set_session_default_db(self, session_id: str, db: Optional[str]) -> None:
+        """Set or clear the per-session default db. Pass db=None to clear."""
+        with self._session_dbs_lock:
+            if db is None:
+                self._session_default_dbs.pop(session_id, None)
+            else:
+                self._session_default_dbs[session_id] = db
+
+    def _resolve_target_db(self, session_id: Optional[str], db_param: Optional[str]) -> Optional[str]:
+        """Resolve the database to USE for a call: explicit param > session default > global default."""
+        if db_param:
+            return db_param
+        return self.get_session_default_db(session_id)
 
     def _get_connection_params(self):
         """Return connection parameters with password resolved only when needed."""
@@ -478,19 +509,21 @@ class DBClient:
 
 
     def execute(
-        self, 
-        statement: str, 
+        self,
+        statement: str,
         db: Optional[str] = None,
-        return_format: Literal["raw", "pandas"] = "raw"
+        return_format: Literal["raw", "pandas"] = "raw",
+        session_id: Optional[str] = None,
     ) -> ResultSet:
         """
         Execute a SQL statement and return results.
-        
+
         Args:
             statement: SQL statement to execute
-            db: Optional database to use (overrides default)
+            db: Optional database to USE before this statement (overrides session/global default)
             return_format: "raw" returns ResultSet with rows, "pandas" also populates pandas field
-            
+            session_id: FastMCP session id; resolves the per-session default db when ``db`` is None
+
         Returns:
             ResultSet with column_names and rows, optionally with pandas DataFrame
         """
@@ -510,52 +543,70 @@ class DBClient:
                 execution_time=0.1,
                 pandas=pandas_df
             )
-        conn = None
-        try:
-            conn = self._get_connection()
-            # Switch database if specified
-            if db and db != self.default_database:
-                cursor_temp = conn.cursor()
-                try:
-                    cursor_temp.execute(f"USE `{db}`")
-                except (MySQLError, adbcError) as db_err:
-                    cursor_temp.close()
-                    return ResultSet(
-                        success=False,
-                        error_message=f"Error switching to database '{db}': {str(db_err)}",
-                        execution_time=0
-                    )
-                cursor_temp.close()
-            return self._execute(conn, statement, None, return_format)
-        except (MySQLError, adbcError) as e:
-            self._handle_db_error(e)
-            return ResultSet(
-                success=False,
-                error_message=f"Error executing statement '{statement}': {str(e)}",
-            )
-        except Exception as e:
-            return ResultSet(
-                success=False,
-                error_message=f"Unexpected error executing statement '{statement}': {str(e)}",
-            )
-        finally:
-            if conn and not self.enable_arrow_flight_sql:
-                try:
-                    conn.close()
-                except:
-                    pass
 
-    def collect_perf_analysis_input(self, query: str, db:Optional[str]=None) -> PerfAnalysisInput:
+        target_db = self._resolve_target_db(session_id, db)
+        # ADBC uses a singleton connection shared across MCP sessions; serialize
+        # USE+query as one atomic block so concurrent callers don't see each
+        # other's USE state. Pool mode hands out a private connection per call,
+        # so no extra lock is needed there.
+        outer_lock = self._adbc_lock if self.enable_arrow_flight_sql else nullcontext()
+        with outer_lock:
+            conn = None
+            try:
+                conn = self._get_connection()
+                # Always USE the resolved target db. The pool's
+                # pool_reset_session=True is not reliable for the current schema
+                # on StarRocks, and the ADBC singleton outright leaks state, so
+                # we re-set it on every call.
+                if target_db:
+                    cursor_temp = conn.cursor()
+                    try:
+                        cursor_temp.execute(f"USE `{target_db}`")
+                    except (MySQLError, adbcError) as db_err:
+                        cursor_temp.close()
+                        return ResultSet(
+                            success=False,
+                            error_message=f"Error switching to database '{target_db}': {str(db_err)}",
+                            execution_time=0
+                        )
+                    cursor_temp.close()
+                return self._execute(conn, statement, None, return_format)
+            except (MySQLError, adbcError) as e:
+                self._handle_db_error(e)
+                return ResultSet(
+                    success=False,
+                    error_message=f"Error executing statement '{statement}': {str(e)}",
+                )
+            except Exception as e:
+                return ResultSet(
+                    success=False,
+                    error_message=f"Unexpected error executing statement '{statement}': {str(e)}",
+                )
+            finally:
+                if conn and not self.enable_arrow_flight_sql:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+
+    def collect_perf_analysis_input(self, query: str, db: Optional[str] = None,
+                                    session_id: Optional[str] = None) -> PerfAnalysisInput:
+        target_db = self._resolve_target_db(session_id, db)
+        outer_lock = self._adbc_lock if self.enable_arrow_flight_sql else nullcontext()
+        with outer_lock:
+            return self._collect_perf_analysis_input_locked(query, target_db)
+
+    def _collect_perf_analysis_input_locked(self, query: str, target_db: Optional[str]) -> PerfAnalysisInput:
         conn = None
         try:
             conn = self._get_connection()
-            # Switch database if specified
-            if db and db != self.default_database:
+            # Always USE the resolved target db (see execute() for rationale).
+            if target_db:
                 cursor_temp = conn.cursor()
                 try:
-                    cursor_temp.execute(f"USE `{db}`")
+                    cursor_temp.execute(f"USE `{target_db}`")
                 except (MySQLError, adbcError) as db_err:
-                    return {"error_message":str(db_err)}
+                    return {"error_message": str(db_err)}
                 finally:
                     cursor_temp.close()
             query_dump_result = self._execute(conn, "select get_query_dump(%s, %s)", (query, False))
