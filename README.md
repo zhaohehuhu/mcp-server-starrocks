@@ -20,7 +20,7 @@ The StarRocks MCP Server acts as a bridge between AI assistants and StarRocks da
 
 ## Prerequisites
 
-- **Python 3.10 or newer.**
+- **Python 3.11 or newer.**
 - A reachable **StarRocks** cluster (FE service). By default the server connects to `localhost:9030` over the MySQL protocol.
 - **[`uv`](https://docs.astral.sh/uv/)** — a fast Python package and project manager (a modern replacement for `pip` + `virtualenv`) from Astral. This project uses `uv` to resolve dependencies, create the virtual environment, and launch the server. The `uv run` commands throughout this README automatically create an isolated environment and install the required dependencies on first use, so no manual `pip install` step is needed.
 
