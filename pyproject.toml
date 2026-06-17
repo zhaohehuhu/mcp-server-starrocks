@@ -4,7 +4,7 @@ version = "0.4.0"
 description = "official MCP server for StarRocks"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "loguru>=0.7.3",
     "fastmcp>=2.14.0",
