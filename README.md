@@ -321,7 +321,7 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
 
 - `top_hot_tables`
 
-  - **Description:** Get top hot tables by audit-log visit count, following Star Management Studio's `top-hot-tables` logic. It joins `information_schema.tables` with `starrocks_audit_db__.starrocks_audit_tbl__`, excludes `root` and `SHOW` statements, matches audit SQL text against table names, and orders by `visit_count` descending.
+  - **Description:** Get top hot tables by audit-log visit count. It joins `information_schema.tables` with `starrocks_audit_db__.starrocks_audit_tbl__`, excludes `root` and `SHOW` statements, matches audit SQL text against table names, and orders by `visit_count` descending.
   - **Input:**
     ```json
     {
