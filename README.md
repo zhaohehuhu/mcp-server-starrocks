@@ -269,6 +269,12 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
 
 - `STARROCKS_MCP_OUTPUT_DIR`: (Optional) Directory used by `read_query` when its `output_file` argument is a relative path. Defaults to `~/.mcp-server-starrocks/output/`. The directory is created on demand. Absolute paths passed to `output_file` (including `~`-prefixed paths) bypass this setting. **Note:** files are written on the machine where the MCP server runs. For Claude Code / Claude Desktop the server runs locally, so files land on your laptop. For remote/http deployments the file lands on the server, not the client.
 
+- `STARROCKS_CHART_OUTPUT_DIR`: (Optional) Directory where `query_and_plotly_chart` writes interactive HTML charts (when `format="html"`). Defaults to the system temp directory. The directory is created on demand. **Note:** like other output files, charts are written on the machine where the MCP server runs.
+
+- `STARROCKS_CHART_INCLUDE_PLOTLYJS`: (Optional) Controls how `plotly.js` is bundled into HTML charts. `cdn` (default) keeps files small but needs network access when viewing; `inline`/`true` embeds the full library for offline use; `directory` and `false` are also accepted (passed through to Plotly's `write_html`).
+
+- `STARROCKS_CHART_DEFAULT_FORMAT`: (Optional) Default output format for `query_and_plotly_chart` when the `format` argument is omitted. One of `json`, `png`, `jpeg` (default), or `html`. Set to `html` to always write an interactive chart file to `STARROCKS_CHART_OUTPUT_DIR` (with an inline PNG preview) without passing `format` on every call. Invalid values fall back to `jpeg` with a warning.
+
 - `STARROCKS_MYSQL_AUTH_PLUGIN`: (Optional) Specifies the authentication plugin to use when connecting to the StarRocks FE service. For example, set to `mysql_clear_password` if your StarRocks deployment requires clear text password authentication (such as when using certain LDAP or external authentication setups). Only set this if your environment specifically requires it; otherwise, the default auth_plugin is used.
 
 ### TLS / SSL Configuration
