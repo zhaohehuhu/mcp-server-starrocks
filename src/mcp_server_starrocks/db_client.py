@@ -176,6 +176,94 @@ def parse_connection_url(connection_url: str) -> dict:
     filtered_result, _ = _parse_connection_url_details(connection_url)
     return filtered_result
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean-ish environment variable."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _build_mysql_ssl_options() -> dict:
+    """
+    Build TLS/SSL connection options for mysql.connector from environment variables.
+
+    Supported environment variables:
+    - STARROCKS_SSL_DISABLED:        'true' to force-disable TLS (overrides everything else).
+    - STARROCKS_SSL_CA:              path to the CA certificate (PEM) used to verify the server.
+    - STARROCKS_SSL_CERT:            path to the client certificate (PEM) for mutual TLS.
+    - STARROCKS_SSL_KEY:             path to the client private key (PEM) for mutual TLS.
+    - STARROCKS_SSL_VERIFY_CERT:     'true' to verify the server certificate against the CA.
+    - STARROCKS_SSL_VERIFY_IDENTITY: 'true' to verify the server hostname against the certificate.
+    - STARROCKS_TLS_VERSIONS:        comma-separated list, e.g. "TLSv1.2,TLSv1.3".
+
+    Notes:
+    - When none of these are set, no SSL keys are injected and mysql.connector keeps its
+      default behavior (ssl-mode PREFERRED: encrypted if the server supports it, no verification).
+    - For real security, set STARROCKS_SSL_CA together with STARROCKS_SSL_VERIFY_CERT=true
+      (and STARROCKS_SSL_VERIFY_IDENTITY=true to also check the hostname).
+    """
+    if _env_flag('STARROCKS_SSL_DISABLED', False):
+        return {'ssl_disabled': True}
+
+    opts: dict = {}
+    ssl_ca = os.getenv('STARROCKS_SSL_CA')
+    ssl_cert = os.getenv('STARROCKS_SSL_CERT')
+    ssl_key = os.getenv('STARROCKS_SSL_KEY')
+    if ssl_ca:
+        opts['ssl_ca'] = ssl_ca
+    if ssl_cert:
+        opts['ssl_cert'] = ssl_cert
+    if ssl_key:
+        opts['ssl_key'] = ssl_key
+    if _env_flag('STARROCKS_SSL_VERIFY_CERT', False):
+        opts['ssl_verify_cert'] = True
+    if _env_flag('STARROCKS_SSL_VERIFY_IDENTITY', False):
+        opts['ssl_verify_identity'] = True
+
+    tls_versions = os.getenv('STARROCKS_TLS_VERSIONS')
+    if tls_versions:
+        versions = [v.strip() for v in tls_versions.split(',') if v.strip()]
+        if versions:
+            opts['tls_versions'] = versions
+
+    return opts
+
+
+def _build_flight_sql_tls(fe_host: str, fe_port: str) -> tuple:
+    """
+    Build the Arrow Flight SQL URI and TLS db_kwargs from environment variables.
+
+    Supported environment variables:
+    - STARROCKS_FE_ARROW_FLIGHT_SQL_USE_TLS: 'true' to use grpc+tls:// instead of plaintext grpc://.
+    - STARROCKS_SSL_CA:                      path to the CA certificate (PEM) used as TLS root certs.
+    - STARROCKS_SSL_VERIFY_CERT:             when 'false' (default), skip server certificate verification.
+
+    Returns a tuple of (uri, tls_db_kwargs).
+    """
+    use_tls = _env_flag('STARROCKS_FE_ARROW_FLIGHT_SQL_USE_TLS', False)
+    if not use_tls:
+        return f"grpc://{fe_host}:{fe_port}", {}
+
+    # Option keys defined by the ADBC Flight SQL driver.
+    tls_skip_verify_key = "adbc.flight.sql.client_option.tls_skip_verify"
+    tls_root_certs_key = "adbc.flight.sql.client_option.tls_root_certs"
+
+    tls_db_kwargs: dict = {}
+    verify_cert = _env_flag('STARROCKS_SSL_VERIFY_CERT', False)
+    tls_db_kwargs[tls_skip_verify_key] = "false" if verify_cert else "true"
+
+    ssl_ca = os.getenv('STARROCKS_SSL_CA')
+    if ssl_ca:
+        try:
+            with open(ssl_ca, 'r') as f:
+                tls_db_kwargs[tls_root_certs_key] = f.read()
+        except OSError as e:
+            print(f"Warning: could not read STARROCKS_SSL_CA '{ssl_ca}': {e}")
+
+    return f"grpc+tls://{fe_host}:{fe_port}", tls_db_kwargs
+
+
 ANSI_ESCAPE_PATTERN = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 
@@ -237,6 +325,8 @@ class DBClient:
             'connect_timeout': int(os.getenv('STARROCKS_CONNECTION_TIMEOUT', '10')),
             'use_pure': os.getenv('STARROCKS_USE_PURE', 'false').lower() in ('true', '1', 'yes'),
         })
+        # Apply optional TLS/SSL options for the MySQL protocol connection.
+        self.connection_params.update(_build_mysql_ssl_options())
         self.default_database = self.connection_params.get('database')
 
         # MySQL connection pool
@@ -326,13 +416,17 @@ class DBClient:
         user = connection_params['user']
         password = connection_params['password']
         
+        uri, tls_db_kwargs = _build_flight_sql_tls(fe_host, fe_port)
+        db_kwargs = {
+            adbc_driver_manager.DatabaseOptions.USERNAME.value: user,
+            adbc_driver_manager.DatabaseOptions.PASSWORD.value: password,
+        }
+        db_kwargs.update(tls_db_kwargs)
+
         try:
             connection = flight_sql.connect(
-                uri=f"grpc://{fe_host}:{fe_port}",
-                db_kwargs={
-                    adbc_driver_manager.DatabaseOptions.USERNAME.value: user,
-                    adbc_driver_manager.DatabaseOptions.PASSWORD.value: password,
-                }
+                uri=uri,
+                db_kwargs=db_kwargs,
             )
             
             # Switch to default database if set

@@ -271,6 +271,38 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
 
 - `STARROCKS_MYSQL_AUTH_PLUGIN`: (Optional) Specifies the authentication plugin to use when connecting to the StarRocks FE service. For example, set to `mysql_clear_password` if your StarRocks deployment requires clear text password authentication (such as when using certain LDAP or external authentication setups). Only set this if your environment specifically requires it; otherwise, the default auth_plugin is used.
 
+### TLS / SSL Configuration
+
+These variables control TLS for the connection. When none of them are set, the underlying `mysql.connector` keeps its default behavior (`ssl-mode=PREFERRED`): the connection is encrypted if the server supports TLS, but the server certificate is **not** verified. For real security, provide a CA certificate and enable verification.
+
+- `STARROCKS_SSL_DISABLED`: (Optional) Set to `true` to force-disable TLS. Overrides all other SSL settings. Defaults to `false`.
+- `STARROCKS_SSL_CA`: (Optional) Path to the CA certificate (PEM) used to verify the StarRocks server certificate.
+- `STARROCKS_SSL_CERT`: (Optional) Path to the client certificate (PEM) for mutual TLS (mTLS).
+- `STARROCKS_SSL_KEY`: (Optional) Path to the client private key (PEM) for mutual TLS (mTLS).
+- `STARROCKS_SSL_VERIFY_CERT`: (Optional) Set to `true` to verify the server certificate against the CA. Defaults to `false`.
+- `STARROCKS_SSL_VERIFY_IDENTITY`: (Optional) Set to `true` to also verify that the server hostname matches the certificate. Defaults to `false`.
+- `STARROCKS_TLS_VERSIONS`: (Optional) Comma-separated list of allowed TLS versions, e.g. `TLSv1.2,TLSv1.3`.
+
+Example (verify the server against a CA certificate):
+
+```json
+"env": {
+  "STARROCKS_HOST": "your-fe-host",
+  "STARROCKS_PORT": "9030",
+  "STARROCKS_USER": "root",
+  "STARROCKS_PASSWORD": "your-password",
+  "STARROCKS_SSL_CA": "/path/to/ca.pem",
+  "STARROCKS_SSL_VERIFY_CERT": "true",
+  "STARROCKS_SSL_VERIFY_IDENTITY": "true"
+}
+```
+
+For the high-performance **Arrow Flight SQL** connection (enabled via `STARROCKS_FE_ARROW_FLIGHT_SQL_PORT`), TLS is controlled separately:
+
+- `STARROCKS_FE_ARROW_FLIGHT_SQL_USE_TLS`: (Optional) Set to `true` to use `grpc+tls://` instead of plaintext `grpc://`. When enabled, `STARROCKS_SSL_CA` is used as the TLS root certificate and `STARROCKS_SSL_VERIFY_CERT=false` (default) skips server certificate verification.
+
+> Security note: avoid storing plaintext passwords directly in `mcp.json`. Prefer injecting `STARROCKS_PASSWORD` (and certificate paths) from a secrets manager or environment, and never commit credentials to version control.
+
 - `MCP_TRANSPORT_MODE`: (Optional) Communication mode that specifies how the MCP Server exposes its services. Available options:
   - `stdio` (default): Communicates through standard input/output, suitable for MCP Host hosting.
   - `streamable-http` (Streamable HTTP): Starts as a Streamable HTTP Server, supporting RESTful API calls.
