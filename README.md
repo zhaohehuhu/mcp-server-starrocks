@@ -357,6 +357,21 @@ For the high-performance **Arrow Flight SQL** connection (enabled via `STARROCKS
     ```
   - **Output:** Text content containing the query analysis results. Uses `ANALYZE PROFILE FROM` if uuid is provided, otherwise uses `EXPLAIN ANALYZE` if sql is provided.
 
+- `top_hot_tables`
+
+  - **Description:** Get top hot tables by audit-log visit count. It joins `information_schema.tables` with `starrocks_audit_db__.starrocks_audit_tbl__`, excludes `root` and `SHOW` statements, matches audit SQL text against table names, and orders by `visit_count` descending.
+  - **Input:**
+    ```json
+    {
+      "db": "optional database/schema filter",
+      "table": "optional table name substring filter",
+      "min_start_time_ms": 1704067200000,
+      "max_start_time_ms": 1704153600000,
+      "top_n": 20
+    }
+    ```
+  - **Output:** Text summary plus structured content containing ranked rows with `db`, `table`, and `visit_count`.
+
 - `query_and_plotly_chart`
 
   - **Description:** Executes a SQL query, loads the results into a Pandas DataFrame, and generates a Plotly chart using a provided Python expression. Designed for visualization in supporting UIs.

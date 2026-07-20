@@ -38,6 +38,10 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware import Middleware
 from .db_client import get_db_client, reset_db_connections, ResultSet, PerfAnalysisInput
 from .db_summary_manager import get_db_summary_manager
+from .table_management_tools import (
+    TableManagementTools,
+    format_top_hot_tables_analysis,
+)
 from .connection_health_checker import (
     initialize_health_checker,
     start_connection_health_checker,
@@ -126,6 +130,7 @@ def _write_result_to_file(result: ResultSet, path: str, fmt: str) -> None:
 db_client = get_db_client()
 # Get database summary manager instance
 db_summary_manager = get_db_summary_manager(db_client)
+table_management_tools = TableManagementTools(db_client)
 # Description suffix for tools, if default db is set
 description_suffix = f". Global default db is `{db_client.default_database}`; use set_session_db to override per session" \
     if db_client.default_database else ". Use set_session_db to set a per-session default database"
@@ -415,7 +420,31 @@ def collect_query_dump_and_profile(
         content=[TextContent(type='text', text=status)],
         structured_content=result,
     )
-
+@mcp.tool(description="Get top hot tables by audit-log visit count")
+def top_hot_tables(
+        db: Annotated[str|None, Field(
+            description="Optional database/schema filter. Matches information_schema.tables.table_schema exactly.")] = None,
+        table: Annotated[str|None, Field(
+            description="Optional table name substring filter. Matches information_schema.tables.table_name with LIKE.")] = None,
+        min_start_time_ms: Annotated[int|None, Field(
+            description="Optional minimum audit-log timestamp as Unix epoch milliseconds. Applied only when max_start_time_ms is also set.")] = None,
+        max_start_time_ms: Annotated[int|None, Field(
+            description="Optional maximum audit-log timestamp as Unix epoch milliseconds. Applied only when min_start_time_ms is also set.")] = None,
+        top_n: Annotated[int, Field(
+            description="Number of hot tables to return. Defaults to 20 and is capped at 100.")] = 20,
+        ctx: Context = None,
+) -> ToolResult:
+    result = table_management_tools.get_top_hot_tables(
+        db=db,
+        table=table,
+        min_start_time_ms=min_start_time_ms,
+        max_start_time_ms=max_start_time_ms,
+        top_n=top_n,
+    )
+    return ToolResult(
+        content=[TextContent(type='text', text=format_top_hot_tables_analysis(result))],
+        structured_content=result,
+    )
 
 def validate_plotly_expr(expr: str):
     """
